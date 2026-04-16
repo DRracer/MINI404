@@ -1041,7 +1041,7 @@ have_xen_pci_passthrough = get_option('xen_pci_passthrough') \
 # the _WIN32_WINNT setting in osdep.h according to the value from glib.
 # You should also check if any of the glib.version() checks
 # below can also be removed.
-glib_req_ver = '>=2.66.0'
+glib_req_ver = '>=2.64.0'
 glib_pc = dependency('glib-2.0', version: glib_req_ver, required: true,
                     method: 'pkg-config')
 glib_cflags = []

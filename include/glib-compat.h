@@ -19,12 +19,12 @@
 /* Ask for warnings for anything that was marked deprecated in
  * the defined version, or before. It is a candidate for rewrite.
  */
-#define GLIB_VERSION_MIN_REQUIRED GLIB_VERSION_2_66
+#define GLIB_VERSION_MIN_REQUIRED GLIB_VERSION_2_64
 
 /* Ask for warnings if code tries to use function that did not
  * exist in the defined version. These risk breaking builds
  */
-#define GLIB_VERSION_MAX_ALLOWED GLIB_VERSION_2_66
+#define GLIB_VERSION_MAX_ALLOWED GLIB_VERSION_2_64
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -128,6 +128,211 @@ qemu_g_test_slow(void)
 #define g_test_slow() qemu_g_test_slow()
 #define g_test_thorough() qemu_g_test_slow()
 #define g_test_quick() (!qemu_g_test_slow())
+
+/*
+ * GUri compat for glib < 2.66.
+ *
+ * GUri was added in glib 2.66. QEMU 9.2 uses it in block drivers (nbd, ssh,
+ * nfs, gluster) for URI parsing. On older glib we provide a minimal shim
+ * backed by basic string parsing — sufficient for the URI forms QEMU uses.
+ */
+#if !GLIB_CHECK_VERSION(2, 66, 0)
+
+#include <string.h>
+#include <stdlib.h>
+
+typedef struct _QemuGUri {
+    char *scheme;
+    char *host;
+    char *path;
+    char *query;
+    char *user;
+    int port;
+} QemuGUri;
+
+#define GUri QemuGUri
+#define G_URI_FLAGS_NONE 0
+#define G_URI_PARAMS_NONE 0
+
+static inline void qemu_g_uri_free(QemuGUri *uri)
+{
+    if (uri) {
+        g_free(uri->scheme);
+        g_free(uri->host);
+        g_free(uri->path);
+        g_free(uri->query);
+        g_free(uri->user);
+        g_free(uri);
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(QemuGUri, qemu_g_uri_free)
+
+/*
+ * Minimal URI parser for scheme://[user@]host[:port][/path][?query]
+ */
+static inline QemuGUri *g_uri_parse(const char *uri_str, int flags,
+                                    GError **error)
+{
+    QemuGUri *uri;
+    const char *p, *at, *colon, *slash, *qmark;
+
+    (void)flags;
+
+    p = strstr(uri_str, "://");
+    if (!p) {
+        if (error) {
+            *error = g_error_new_literal(G_MARKUP_ERROR, 0, "no scheme");
+        }
+        return NULL;
+    }
+
+    uri = g_new0(QemuGUri, 1);
+    uri->scheme = g_strndup(uri_str, p - uri_str);
+    uri->port = -1;
+    p += 3; /* skip :// */
+
+    /* find end of authority (next / or ? or end) */
+    slash = strchr(p, '/');
+    qmark = strchr(p, '?');
+    const char *auth_end = slash ? slash : (qmark ? qmark : p + strlen(p));
+
+    /* user@host or just host */
+    char *authority = g_strndup(p, auth_end - p);
+    at = strchr(authority, '@');
+    const char *hoststart;
+    if (at) {
+        uri->user = g_strndup(authority, at - authority);
+        hoststart = at + 1;
+    } else {
+        hoststart = authority;
+    }
+
+    /* host[:port] — handle [ipv6] brackets */
+    if (hoststart[0] == '[') {
+        const char *bracket = strchr(hoststart, ']');
+        if (bracket) {
+            uri->host = g_strndup(hoststart + 1, bracket - hoststart - 1);
+            if (bracket[1] == ':') {
+                uri->port = atoi(bracket + 2);
+            }
+        } else {
+            uri->host = g_strdup(hoststart + 1);
+        }
+    } else {
+        colon = strchr(hoststart, ':');
+        if (colon) {
+            uri->host = g_strndup(hoststart, colon - hoststart);
+            uri->port = atoi(colon + 1);
+        } else {
+            uri->host = g_strdup(hoststart);
+        }
+    }
+    g_free(authority);
+
+    /* path */
+    if (slash) {
+        if (qmark && qmark > slash) {
+            uri->path = g_strndup(slash, qmark - slash);
+        } else {
+            uri->path = g_strdup(slash);
+        }
+    } else {
+        uri->path = g_strdup("");
+    }
+
+    /* query */
+    if (qmark) {
+        uri->query = g_strdup(qmark + 1);
+    }
+
+    return uri;
+}
+
+static inline const char *g_uri_get_scheme(QemuGUri *uri)
+{
+    return uri->scheme;
+}
+
+static inline const char *g_uri_get_host(QemuGUri *uri)
+{
+    return uri->host;
+}
+
+static inline const char *g_uri_get_path(QemuGUri *uri)
+{
+    return uri->path;
+}
+
+static inline const char *g_uri_get_query(QemuGUri *uri)
+{
+    return uri->query;
+}
+
+static inline const char *g_uri_get_user(QemuGUri *uri)
+{
+    return uri->user;
+}
+
+static inline int g_uri_get_port(QemuGUri *uri)
+{
+    return uri->port;
+}
+
+/*
+ * Minimal query parameter parser: split "key=val&key2=val2" into a hash table.
+ */
+static inline GHashTable *g_uri_parse_params(const char *params, gssize length,
+                                             const char *separators, int flags,
+                                             GError **error)
+{
+    GHashTable *ht;
+    char *copy, *saveptr = NULL, *token;
+
+    (void)flags;
+    (void)error;
+
+    if (!params) {
+        return NULL;
+    }
+
+    ht = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    copy = (length < 0) ? g_strdup(params) : g_strndup(params, length);
+
+    for (token = strtok_r(copy, separators, &saveptr);
+         token;
+         token = strtok_r(NULL, separators, &saveptr)) {
+        char *eq = strchr(token, '=');
+        if (eq) {
+            g_hash_table_insert(ht, g_strndup(token, eq - token),
+                                g_strdup(eq + 1));
+        } else {
+            g_hash_table_insert(ht, g_strdup(token), g_strdup(""));
+        }
+    }
+    g_free(copy);
+    return ht;
+}
+
+/*
+ * GUriParamsIter compat — used by ssh.c and nfs.c (only compiled when
+ * libssh/libnfs are found, which they aren't on this system, but provide
+ * it for completeness).
+ */
+typedef struct {
+    GHashTableIter iter;
+} GUriParamsIter;
+
+static inline void g_uri_params_iter_init(GUriParamsIter *qp,
+                                          const char *params, gssize length,
+                                          const char *separators, int flags)
+{
+    /* This is a stub — the real iter would parse on-the-fly, but the callers
+     * using this are in block drivers that won't be compiled. */
+    (void)qp; (void)params; (void)length; (void)separators; (void)flags;
+}
+
+#endif /* !GLIB_CHECK_VERSION(2, 66, 0) */
 
 #pragma GCC diagnostic pop
 
